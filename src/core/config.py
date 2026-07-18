@@ -7,17 +7,13 @@ from pathlib import Path
 # Define basic directions
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
-DB_DIR = BASE_DIR / "storage"
-MODEL_DIR = BASE_DIR / "model"
-UPLOAD_DIR = BASE_DIR / "upload"
-DOWNLOAD_DIR = BASE_DIR / "downloads"
-RUNTIME_DIR = BASE_DIR / "runtime"
 
-DB_PATH = DB_DIR / "card_ocr.db"
+MODEL_DIR = BASE_DIR / "model"
+RUNTIME_DIR = BASE_DIR / "runtime"
 LOG_PATH = RUNTIME_DIR / "app.log"
 
 # Automatic detection and physical completion during system initialization
-for directory in [DB_DIR, MODEL_DIR, UPLOAD_DIR, DOWNLOAD_DIR, RUNTIME_DIR]:
+for directory in [MODEL_DIR, RUNTIME_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
 # Limitation arguments

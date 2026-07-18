@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI):
 
     # 启动 OCR worker 线程池（2 个线程），复用同一个预热好的引擎单例
     start_workers(num_workers=2)
-    logger.info("OCR worker 线程池已启动（2 workers）。")
+    logger.info("OCR worker 线程池已启动(2 workers)。")
 
     yield
 

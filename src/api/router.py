@@ -11,7 +11,6 @@ from fastapi.responses import StreamingResponse
 from src.core.excepts import AppException, ErrorCode
 from src.api.middleware import validate_ocr_file
 from src.api.schemas import UnifiedResponse, SubmitRowResult
-from src.core.files import FileManagerService
 from src.core.memory_store import memory_store, OCRTask
 from src.core.logger import logger
 

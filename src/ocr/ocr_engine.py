@@ -352,44 +352,47 @@ class OCREnginerSrv:
                     "length": len(digit)
                 })
 
-        # 2. 按Y坐标排序
-        digit_items.sort(key=lambda k: k["y"])
-
-        # 3. 策略1：找到最长的数字片段（最可能是完整卡号）
+        # 2. 按Y坐标分组，找到最可能是卡号的那一行
         if digit_items:
-            longest_item = max(digit_items, key=lambda k: k["length"])
+            # 按 Y 坐标聚类（容忍更大的偏差，因为卡号数字可能有轻微倾斜或高低差）
+            y_coords = [item["y"] for item in digit_items]
+            y_threshold = 30  # 放宽到 30px，适应更多场景
 
-            if longest_item["length"] >= 12:
-                # 如果最长片段>=12位，直接使用
-                info["卡号"] = longest_item["text"]
-            else:
-                # 策略2：检查是否所有数字片段在同一行（Y 坐标相近）
-                y_coords = [item["y"] for item in digit_items]
-                y_range = max(y_coords) - min(y_coords)
+            # 将数字片段按 Y 坐标分组
+            y_groups = []
+            for item in digit_items:
+                added = False
+                for group in y_groups:
+                    # 如果与组内任意元素的 Y 坐标差小于阈值，加入该组
+                    if any(abs(item["y"] - g["y"]) < y_threshold for g in group):
+                        group.append(item)
+                        added = True
+                        break
+                if not added:
+                    y_groups.append([item])
 
-                if y_range < 20:  # Y 坐标差异小于 20px，认为在同一行
-                    # 同一行的数字段按 X 坐标排序后全部拼接
-                    digit_items.sort(key=lambda k: k["x"])
-                    combined = ''.join([item["text"] for item in digit_items])
-                    if len(combined) >= 12:
-                        info["卡号"] = combined[:19]
-                    elif len(combined) >= 4:
-                        info["卡号"] = combined
-                else:
-                    # 不在同一行，使用原有的"下半部分"策略（Y 坐标较大的部分）
-                    total_items = len(digit_items)
-                    lower_half_start = max(0, total_items // 2)
-                    lower_half_digits = [item for item in digit_items[lower_half_start:]]
+            # 3. 选择最可能是卡号的那一组（优先：总长度最长的组）
+            best_group = None
+            max_total_length = 0
 
-                    if lower_half_digits:
-                        lower_half_digits.sort(key=lambda k: k["x"])
-                        combined = ''.join([item["text"] for item in lower_half_digits])
+            for group in y_groups:
+                total_length = sum(item["length"] for item in group)
+                if total_length > max_total_length:
+                    max_total_length = total_length
+                    best_group = group
 
-                        if len(combined) >= 12:
-                            info["卡号"] = combined[:19]
-                        elif len(combined) >= 4:
-                            # 即使不足12位，也保留（总比没有好）
-                            info["卡号"] = combined
+            # 4. 合并选中组内的所有数字片段
+            if best_group:
+                # 按 X 坐标从左到右排序
+                best_group.sort(key=lambda k: k["x"])
+                combined = ''.join([item["text"] for item in best_group])
+
+                # 验证合并后的长度是否合理（银行卡号通常 16-19 位）
+                if len(combined) >= 12:
+                    info["卡号"] = combined[:19]  # 最多保留 19 位
+                elif len(combined) >= 4:
+                    # 即使不足标准长度，也保留（可能是特殊卡）
+                    info["卡号"] = combined
 
         # 回退方案：标准格式匹配
         if not info["卡号"]:
