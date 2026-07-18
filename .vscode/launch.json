@@ -1,0 +1,44 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${file}",
+            // "console": "integratedTerminal",
+            "console": "internalConsole",
+            "justMyCode": true,
+            "redirectOutput": true,
+            "showReturnValue": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONUNBUFFERED": "1",
+                "DEBUG_TRACE": "1"
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Python: Main File",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "${workspaceFolder}/.venv/bin/python",
+            "program": "${workspaceFolder}/src/main.py",
+            // "console": "integratedTerminal",
+            "console": "internalConsole",
+            "justMyCode": true,
+            "redirectOutput": true,
+            "showReturnValue": false,
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}",
+                "PYTHONUNBUFFERED": "1",
+                "DEBUG_TRACE": "1"
+            },
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import re
+import shutil
+from huggingface_hub import hf_hub_download
+from mrz.checker.td3 import TD3CodeChecker
+from src.core.logger import logger
+from src.core.config import MODEL_DIR, MODELS_CONFIG
+from src.core.excepts import AppException, ErrorCode
+
+
+class ModelManagerSrv:
+    """
+    Hugging Face PaddlePaddle 官方源权重文件管理服务
+    """
+
+    @staticmethod
+    def check_and_download_models():
+        logger.info("启动基于 Hugging Face 官方 SDK 的 PP-OCRv6 权重环境自检...")
+
+        for key, cfg in MODELS_CONFIG.items():
+            target_path = MODEL_DIR / cfg["local_filename"]
+
+            if not target_path.exists():
+                logger.warning(
+                    f"检测到本地缺失模型文件: {cfg['local_filename']}，准备从 Hugging Face 库自动拉取..."
+                )
+                try:
+                    # 1. 触发官方 SDK 弹性下载（自带原生 tqdm 进度条，支持环境变量代理和断点续传）
+                    temp_downloaded_path = hf_hub_download(
+                        repo_id=cfg["repo_id"],
+                        filename=cfg["filename"],
+                        local_dir=MODEL_DIR,  # 指定直接落盘目录
+                        local_dir_use_symlinks=
+                        False,  # 物理写入，避免在部分 Windows 环境下由于软链接权限不足引发的错误
+                    )
+
+                    # 2. 将通用的 'inference.onnx' 重命名为系统可区分的本地专有名称
+                    shutil.move(temp_downloaded_path, target_path)
+                    logger.info(
+                        f"Hugging Face 官方权重 {cfg['local_filename']} 物理落盘并校验完成。"
+                    )
+
+                except Exception as sdk_err:
+                    logger.critical(
+                        f"通过 Hugging Face SDK 拉取权重失败: {str(sdk_err)}")
+
+                    # 友好引导异常抛出
+                    raise AppException(
+                        code=ErrorCode.OCR_ENGINE_ERROR,
+                        message=
+                        (f"无法通过 Hugging Face Hub 自动下载权重 '{cfg['local_filename']}'。原因: {str(sdk_err)}。 "
+                         f"如果是国内部署，建议在终端中先设置环境变量：'export HF_ENDPOINT=https://hf-mirror.com' 再拉起服务；"
+                         f"如果是隔离内网，请手动将手动下载的文件放置在本地 '{MODEL_DIR}' 目录下。"),
+                        status_code=500)
+            else:
+                logger.info(f"权重自检通过: {cfg['local_filename']}")
+
+
+class OCREnginerSrv:
+
+    @staticmethod
+    def sort_ocr_results(ocr_results: list) -> list:
+        """Multi-scale card text block physical space logical rearrangement"""
+        if not ocr_results:
+            return []
+
+        items = []
+        for item in ocr_results:
+            box, text, score = item[0], item[1], item[2] if len(
+                item) > 2 else 0.9
+            x, y = box[0][0], box[0][1]
+            items.append({
+                "x": x,
+                "y": y,
+                "text": text.strip(),
+                "score": score
+            })
+
+        items.sort(key=lambda k: k["y"])
+
+        lines = []
+        if items:
+            current_line = [items[0]]
+            for item in items[1:]:
+                if item["y"] - current_line[-1]["y"] < 15:
+                    current_line.append(item)
+                else:
+                    current_line.sort(key=lambda k: k["x"])
+                    lines.extend(current_line)
+                    current_line = [item]
+            current_line.sort(key=lambda k: k["x"])
+            lines.extend(current_line)
+
+        return lines
+
+    @classmethod
+    def classify_id_card_side(cls, ocr_results: list) -> str:
+        """Rapid classification of Front/Back of ID Cards Based on Word Frequency Topological Features"""
+        full_text = "\n".join([line[1].strip() for line in ocr_results])
+        if any(k in full_text for k in ["签发机关", "有效期限", "有效期", "中华人民共和国"]):
+            return "back"
+        if any(k in full_text for k in ["公民身份号码", "姓名", "性别", "住址"]):
+            return "front"
+        return "unknown"
+
+    @classmethod
+    def parse_id_card_front(cls, ocr_results: list) -> dict:
+        """人像面提取引擎"""
+        sorted_items = cls.sort_ocr_results(ocr_results)
+        texts = [item["text"] for item in sorted_items]
+        full_text = "\n".join(texts)
+
+        info = {"姓名": "", "性别": "", "民族": "", "出生": "", "住址": "", "公民身份号码": ""}
+
+        id_pattern = r'[1-9]\d{5}(18|19|20)\d{2}((0[1-9])|(1[0-2]))(([0-2][1-9])|10|20|30|31)\d{3}[0-9Xx]'
+        id_match = re.search(id_pattern, full_text)
+        if id_match:
+            info["公民身份号码"] = id_match.group(0)
+
+        birth_match = re.search(r'(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)',
+                                full_text)
+        if birth_match:
+            info["出生"] = birth_match.group(1).replace(" ", "")
+
+        for i, item in enumerate(sorted_items):
+            text = item["text"]
+            if "姓名" in text:
+                val = text.replace("姓名", "").replace(":",
+                                                     "").replace("：",
+                                                                 "").strip()
+                if len(val) >= 2:
+                    info["姓名"] = val
+                elif i + 1 < len(sorted_items):
+                    info["姓名"] = sorted_items[i + 1]["text"]
+            elif "性别" in text or "盟" in text:  # OCR 常把"性别"误识别为"盟"
+                # 先尝试精确匹配 "性别男" 或 "性别女"，允许空格、冒号、制表符等分隔
+                gender_match = re.search(r'[性盟]别?[\s:：]*([男女])', text)
+                if gender_match:
+                    info["性别"] = gender_match.group(1)
+                else:
+                    # fallback：去掉"性别"/"盟"后如果整个是"男"或"女"
+                    gender_val = text.replace("性别", "").replace(
+                        "盟", "").replace(":", "").replace("：", "").strip()
+                    if gender_val in ["男", "女"]:
+                        info["性别"] = gender_val
+            # 处理没有字段名，直接出现"男"或"女"的情况
+            elif not info["性别"] and text.strip() in ["男", "女"]:
+                info["性别"] = text.strip()
+            # 处理"男民族汉"这种粘连
+            elif not info["性别"] and re.match(r'^[男女]', text):
+                gender_match = re.match(r'^([男女])', text)
+                if gender_match:
+                    info["性别"] = gender_match.group(1)
+            elif "民族" in text:
+                # 先尝试精确匹配 "民族XX"，不包含其他字段关键词
+                nation_match = re.search(r'民族\s*([^\s性别出生住址公民]{1,5})', text)
+                if nation_match:
+                    info["民族"] = nation_match.group(1)
+                else:
+                    # fallback
+                    nation_val = text.replace("民族",
+                                              "").replace(":", "").replace(
+                                                  "：", "").strip()
+                    # 去除常见误识别（如果包含其他字段关键词就跳过）
+                    if len(nation_val) >= 1 and not any(
+                            k in nation_val
+                            for k in ["性别", "出生", "住址", "男", "女"]):
+                        info["民族"] = nation_val
+            elif "住址" in text or "址" in text:
+                addr_parts = [text.replace("住址", "").replace("址", "").strip()]
+                j = i + 1
+                while j < len(sorted_items):
+                    next_text = sorted_items[j]["text"]
+                    # 停止条件：遇到身份证号、或其他字段关键词
+                    if any(k in next_text for k in ["公民身份号码", "号码", "身份"]):
+                        break
+                    # 如果这行包含18位数字（身份证号pattern），也停止
+                    if re.search(r'[1-9]\d{17}', next_text):
+                        break
+                    if len(next_text) > 2 and not any(
+                            k in next_text for k in ["姓名", "性别", "民族", "出生"]):
+                        addr_parts.append(next_text)
+                    j += 1
+                info["住址"] = "".join(addr_parts)
+
+        # regex fallback: 当性别/民族与其他字段在同一 OCR token 中时（如"性别男民族汉"），per-item 逻辑会漏掉
+        if not info["性别"]:
+            # 匹配"性别"或常见误识别"盟"
+            gm = re.search(r'[性盟]别?[\s:：]*([男女])', full_text)
+            if gm:
+                info["性别"] = gm.group(1)
+            # 如果还找不到，找独立的"男"或"女"（前后没有其他汉字）
+            if not info["性别"]:
+                gm2 = re.search(r'(?:^|\n)([男女])(?:民族|$|\n)', full_text)
+                if gm2:
+                    info["性别"] = gm2.group(1)
+        if not info["民族"]:
+            nm = re.search(r'民族\s*([^\s性别出生住址公民]{1,5})', full_text)
+            if nm:
+                info["民族"] = nm.group(1)
+
+        return info
+
+    @classmethod
+    def parse_id_card_back(cls, ocr_results: list) -> dict:
+        """国徽面提取引擎"""
+        texts = [line[1].strip() for line in ocr_results]
+        full_text = "\n".join(texts)
+
+        info = {"签发机关": "", "有效期限": ""}
+
+        # 提取签发机关：需要排除无效内容
+        # 常见无效内容："居民身份证"、"中华人民共和国"
+        invalid_issuer_keywords = ["居民身份证", "中华人民共和国", "身份证", "有效期限"]
+
+        # 方法1：正则提取签发机关（更灵活，支持OCR误识别）
+        # 匹配 "签发机关" 后面的内容（可能有冒号、空格等分隔符）
+        issuer_pattern = r'签发机关[\s:：]*([^\n\d]{2,20})'
+        issuer_match = re.search(issuer_pattern, full_text)
+        if issuer_match:
+            candidate = issuer_match.group(1).strip()
+            # 检查是否为无效内容
+            if not any(invalid in candidate for invalid in invalid_issuer_keywords):
+                info["签发机关"] = candidate
+
+        # 方法2：如果方法1失败，逐行匹配并寻找有效的签发机关
+        if not info["签发机关"]:
+            found_keyword = False
+            for i, t in enumerate(texts):
+                # 找到"签发机关"关键词所在行
+                if any(kw in t for kw in ["签发机关", "签发", "机关"]):
+                    found_keyword = True
+                    # 尝试从当前行提取
+                    val = t
+                    for remove_word in ["签发机关", "签发", "机关", ":", "：", "发证", "发"]:
+                        val = val.replace(remove_word, "")
+                    val = val.strip()
+
+                    # 如果当前行提取到有效内容（2个字以上，不全是数字，不是无效关键词）
+                    if len(val) >= 2 and not val.isdigit() and not any(invalid in val for invalid in invalid_issuer_keywords):
+                        info["签发机关"] = val
+                        break
+                    # 否则继续往后找，直到找到有效内容
+                    elif i + 1 < len(texts):
+                        # 从下一行开始往后找，跳过无效内容
+                        for j in range(i + 1, len(texts)):
+                            next_line = texts[j].strip()
+                            # 跳过有效期行（包含日期格式）
+                            if re.search(r'\d{4}.*\d{4}|长期', next_line):
+                                continue
+                            # 跳过无效关键词
+                            if any(invalid in next_line for invalid in invalid_issuer_keywords):
+                                continue
+                            # 跳过纯数字或过短的内容
+                            if next_line.isdigit() or len(next_line) < 2:
+                                continue
+                            # 找到有效签发机关
+                            info["签发机关"] = next_line
+                            break
+                        if info["签发机关"]:
+                            break
+
+        # 如果还是没找到，尝试在所有文本中找包含"公安局"、"派出所"等关键词的行
+        if not info["签发机关"]:
+            for t in texts:
+                if any(kw in t for kw in ["公安局", "派出所", "公安分局", "公安厅"]):
+                    if not any(invalid in t for invalid in invalid_issuer_keywords):
+                        info["签发机关"] = t.strip()
+                        break
+
+        # 提取有效期限
+        period_match = re.search(
+            r'(\d{4}[\.\-\:\/]\d{2}[\.\-\:\/]\d{2}\s*-\s*(\d{4}[\.\-\:\/]\d{2}[\.\-\:\/]\d{2}|长期))',
+            full_text)
+        if period_match:
+            info["有效期限"] = period_match.group(1).replace(" ", "")
+
+        return info
+
+    @classmethod
+    def parse_passport(cls, ocr_results: list) -> dict:
+        """护照高容错机读码(MRZ)解码引擎"""
+        mrz_lines = []
+        for line in ocr_results:
+            text = line[1].replace(" ", "").upper()
+            if len(text) >= 40 and text.count('<') >= 5:
+                mrz_lines.append(text)
+
+        if len(mrz_lines) >= 2:
+            target_mrz = mrz_lines[-2:]
+            mrz_string = f"{target_mrz[0]}\n{target_mrz[1]}"
+            try:
+                checker = TD3CodeChecker(mrz_string)
+                if checker:
+                    fields = checker.fields()
+                    return {
+                        "解析成功": "是",
+                        "护照号": fields.document_number,
+                        "姓": fields.surname,
+                        "名": fields.given_names,
+                        "国籍": fields.nationality,
+                        "出生日期": fields.birth_date,
+                        "性别": fields.sex,
+                        "有效期至": fields.expiry_date
+                    }
+            except Exception as e:
+                logger.warning(f"MRZ 校验失效: {str(e)}")
+                return {
+                    "解析成功": "否",
+                    "错误原因": f"MRZ 校验异常: {str(e)}",
+                    "提取原始区": mrz_string
+                }
+
+        return {"解析成功": "否", "错误原因": "未检出合规双行护照 MRZ 区"}
+
+    @classmethod
+    def parse_bank_card(cls, ocr_results: list) -> dict:
+        """银行卡字段提取引擎
+
+        提取字段：
+        - 卡号：16-19位数字（支持空格分隔）
+        - 银行名称：关键词匹配
+
+        利用坐标信息：银行卡号通常在卡片中下部凸起区域，Y坐标较大
+        """
+        if not ocr_results:
+            return {"卡号": "", "银行名称": ""}
+
+        texts = [line[1].strip() for line in ocr_results]
+        full_text = "\n".join(texts)
+
+        info = {"卡号": "", "银行名称": ""}
+
+        # 提取卡号：利用坐标信息（卡号通常在Y坐标较大的位置，且是凸起数字）
+        # 1. 收集所有数字片段及其坐标
+        digit_items = []
+        for item in ocr_results:
+            box, text, score = item[0], item[1], item[2] if len(item) > 2 else 0.9
+            y_center = (box[0][1] + box[2][1]) / 2  # 取矩形框中心Y坐标
+            x_left = box[0][0]  # 左边界X坐标
+
+            # 提取所有连续数字（长度>=3）
+            digits = re.findall(r'\d{3,}', text)
+            for digit in digits:
+                digit_items.append({
+                    "y": y_center,
+                    "x": x_left,
+                    "text": digit,
+                    "score": score,
+                    "length": len(digit)
+                })
+
+        # 2. 按Y坐标排序
+        digit_items.sort(key=lambda k: k["y"])
+
+        # 3. 策略1：找到最长的数字片段（最可能是完整卡号）
+        if digit_items:
+            longest_item = max(digit_items, key=lambda k: k["length"])
+
+            if longest_item["length"] >= 12:
+                # 如果最长片段>=12位，直接使用
+                info["卡号"] = longest_item["text"]
+            else:
+                # 策略2：检查是否所有数字片段在同一行（Y 坐标相近）
+                y_coords = [item["y"] for item in digit_items]
+                y_range = max(y_coords) - min(y_coords)
+
+                if y_range < 20:  # Y 坐标差异小于 20px，认为在同一行
+                    # 同一行的数字段按 X 坐标排序后全部拼接
+                    digit_items.sort(key=lambda k: k["x"])
+                    combined = ''.join([item["text"] for item in digit_items])
+                    if len(combined) >= 12:
+                        info["卡号"] = combined[:19]
+                    elif len(combined) >= 4:
+                        info["卡号"] = combined
+                else:
+                    # 不在同一行，使用原有的"下半部分"策略（Y 坐标较大的部分）
+                    total_items = len(digit_items)
+                    lower_half_start = max(0, total_items // 2)
+                    lower_half_digits = [item for item in digit_items[lower_half_start:]]
+
+                    if lower_half_digits:
+                        lower_half_digits.sort(key=lambda k: k["x"])
+                        combined = ''.join([item["text"] for item in lower_half_digits])
+
+                        if len(combined) >= 12:
+                            info["卡号"] = combined[:19]
+                        elif len(combined) >= 4:
+                            # 即使不足12位，也保留（总比没有好）
+                            info["卡号"] = combined
+
+        # 回退方案：标准格式匹配
+        if not info["卡号"]:
+            card_number_pattern = r'(\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}(?:[\s\-]?\d{3})?)'
+            card_match = re.search(card_number_pattern, full_text)
+            if card_match:
+                info["卡号"] = card_match.group(1).replace(" ", "").replace("-", "")
+
+        # 提取银行名称：关键词匹配
+        bank_keywords = {
+            "工商银行": ["工商", "ICBC"],
+            "农业银行": ["农业", "ABC"],
+            "建设银行": ["建设", "CCB"],
+            "中国银行": ["中国银行", "BOC", "BANK OF CHINA"],
+            "交通银行": ["交通", "BCM"],
+            "招商银行": ["招商", "CMB"],
+            "邮政储蓄": ["邮政", "PSBC"],
+            "民生银行": ["民生", "CMBC"],
+            "中信银行": ["中信", "CITIC"],
+            "光大银行": ["光大", "CEB"],
+            "浦发银行": ["浦发", "SPDB"],
+            "兴业银行": ["兴业", "CIB"],
+            "平安银行": ["平安银行", "PAB"],
+            "华夏银行": ["华夏", "HXB"],
+            "广发银行": ["广发", "GDB"]
+        }
+
+        for bank_name, keywords in bank_keywords.items():
+            if any(kw in full_text for kw in keywords):
+                info["银行名称"] = bank_name
+                break
+
+        # 银行名称回退方案：提取包含"银行"/"信用社"的文本行
+        if not info["银行名称"]:
+            for text in texts:
+                # 匹配包含"银行"、"信用社"、"信用联社"、"农商行"等的文本
+                if re.search(r'(银行|信用社|信用联社|农商行|农信社)', text):
+                    # 清理掉常见的非银行名称部分
+                    cleaned = re.sub(r'(卡号|账号|户名|开户行[:：]?|发卡行[:：]?)', '', text).strip()
+                    if len(cleaned) >= 4:  # 至少4个字符才认为是有效银行名
+                        info["银行名称"] = cleaned
+                        break
+
+        return info
