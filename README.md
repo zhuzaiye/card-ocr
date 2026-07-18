@@ -3,10 +3,9 @@
 本地化、隐私优先的卡证 OCR 识别系统，支持身份证、银行卡、护照等多种卡证类型的自动识别与批量校对。
 
 
+![demo](./assets/test_demo_cover.png)
 
-[![demo](./assets/test_demo_cover.png)](./assets/test_demo_video.mp4)
-
-
+![demo](./assets/test_demo_video.gif)
 
 
 ## 核心特性
