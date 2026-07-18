@@ -62,14 +62,19 @@ class OCREnginerSrv:
 
     @staticmethod
     def sort_ocr_results(ocr_results: list) -> list:
-        """Multi-scale card text block physical space logical rearrangement"""
+        """
+        多尺度卡证文本块的物理空间逻辑重排
+
+        修复：使用绝对Y坐标分组，而非相对差值
+        - 旧算法：逐个比较与当前行最后元素的Y差 → 导致"链式累积"错误
+        - 新算法：与当前行第一个元素比较Y差 → 真正的同行判断
+        """
         if not ocr_results:
             return []
 
         items = []
         for item in ocr_results:
-            box, text, score = item[0], item[1], item[2] if len(
-                item) > 2 else 0.9
+            box, text, score = item[0], item[1], item[2] if len(item) > 2 else 0.9
             x, y = box[0][0], box[0][1]
             items.append({
                 "x": x,
@@ -78,18 +83,28 @@ class OCREnginerSrv:
                 "score": score
             })
 
+        # 按Y坐标排序
         items.sort(key=lambda k: k["y"])
 
+        # 按行分组：与行首元素比较Y差（而非与上一个元素比较）
         lines = []
         if items:
             current_line = [items[0]]
+            line_y = items[0]["y"]  # 记录当前行的基准Y坐标
+
             for item in items[1:]:
-                if item["y"] - current_line[-1]["y"] < 15:
+                # 关键修复：与行首Y坐标比较，而非与上一个元素比较
+                if abs(item["y"] - line_y) < 15:
                     current_line.append(item)
                 else:
+                    # 当前行结束，按X坐标排序
                     current_line.sort(key=lambda k: k["x"])
                     lines.extend(current_line)
+                    # 开始新行
                     current_line = [item]
+                    line_y = item["y"]
+
+            # 处理最后一行
             current_line.sort(key=lambda k: k["x"])
             lines.extend(current_line)
 
@@ -97,12 +112,27 @@ class OCREnginerSrv:
 
     @classmethod
     def classify_id_card_side(cls, ocr_results: list) -> str:
-        """Rapid classification of Front/Back of ID Cards Based on Word Frequency Topological Features"""
+        """Rapid classification of Front/Back of ID Cards Based on Word Frequency Topological Features
+
+        优先级：正面 > 背面 > 未知
+        当同时包含正反面关键词时（如合影），优先识别为正面（因为正面信息更关键）
+        """
         full_text = "\n".join([line[1].strip() for line in ocr_results])
-        if any(k in full_text for k in ["签发机关", "有效期限", "有效期", "中华人民共和国"]):
-            return "back"
-        if any(k in full_text for k in ["公民身份号码", "姓名", "性别", "住址"]):
+
+        # 正面关键词（优先判断）
+        front_keywords = ["公民身份号码", "姓名", "性别", "住址", "出生", "民族"]
+        front_count = sum(1 for k in front_keywords if k in full_text)
+
+        # 背面关键词
+        back_keywords = ["签发机关", "有效期限", "有效期", "中华人民共和国居民身份证"]
+        back_count = sum(1 for k in back_keywords if k in full_text)
+
+        # 判断逻辑：关键词数量多的优先
+        if front_count > 0 and front_count >= back_count:
             return "front"
+        if back_count > 0:
+            return "back"
+
         return "unknown"
 
     @classmethod
@@ -114,10 +144,20 @@ class OCREnginerSrv:
 
         info = {"姓名": "", "性别": "", "民族": "", "出生": "", "住址": "", "公民身份号码": ""}
 
+        # 提取身份证号：增强匹配，处理OCR误识别和粘连
+        # 1. 标准18位身份证号格式（允许前后有其他字符）
         id_pattern = r'[1-9]\d{5}(18|19|20)\d{2}((0[1-9])|(1[0-2]))(([0-2][1-9])|10|20|30|31)\d{3}[0-9Xx]'
         id_match = re.search(id_pattern, full_text)
         if id_match:
             info["公民身份号码"] = id_match.group(0)
+        else:
+            # 2. 回退方案：逐行查找连续18位数字（允许末尾是X）
+            for text in texts:
+                # 匹配18位数字或17位数字+X
+                id_match = re.search(r'[1-9]\d{16}[\dXx]', text)
+                if id_match:
+                    info["公民身份号码"] = id_match.group(0).upper()
+                    break
 
         birth_match = re.search(r'(\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日)',
                                 full_text)
@@ -153,9 +193,20 @@ class OCREnginerSrv:
                 gender_match = re.match(r'^([男女])', text)
                 if gender_match:
                     info["性别"] = gender_match.group(1)
-            elif "民族" in text:
-                # 先尝试精确匹配 "民族XX"，不包含其他字段关键词
-                nation_match = re.search(r'民族\s*([^\s性别出生住址公民]{1,5})', text)
+                # 同时尝试提取民族（如"男民族汉" -> "汉"）
+                if not info["民族"]:
+                    nation_match = re.search(r'[男女]民[族旗]?([^\s性别出生住址公民]{1,5})', text)
+                    if nation_match:
+                        info["民族"] = nation_match.group(1)
+            # 处理"民汉"这种直接粘连（没有"族"字）
+            elif not info["民族"] and re.match(r'^民[^族]', text):
+                # "民汉" -> "汉"
+                nation_match = re.match(r'^民([^族\s]{1,5})', text)
+                if nation_match:
+                    info["民族"] = nation_match.group(1)
+            elif "民族" in text or "民旗" in text:  # OCR常把"民族"误识别为"民旗"
+                # 先尝试精确匹配 "民族XX" 或 "民旗XX"，不包含其他字段关键词
+                nation_match = re.search(r'民[族旗]\s*([^\s性别出生住址公民]{1,5})', text)
                 if nation_match:
                     info["民族"] = nation_match.group(1)
                 else:
@@ -197,9 +248,15 @@ class OCREnginerSrv:
                 if gm2:
                     info["性别"] = gm2.group(1)
         if not info["民族"]:
-            nm = re.search(r'民族\s*([^\s性别出生住址公民]{1,5})', full_text)
+            # 支持"民族"和"民旗"（OCR误识别）
+            nm = re.search(r'民[族旗]\s*([^\s性别出生住址公民]{1,5})', full_text)
             if nm:
                 info["民族"] = nm.group(1)
+            # 如果还找不到，尝试"民X"模式（直接粘连，如"民汉"）
+            if not info["民族"]:
+                nm2 = re.search(r'(?:^|\n|[男女])民([^族旗\s]{1,3})(?:\n|$)', full_text)
+                if nm2:
+                    info["民族"] = nm2.group(1)
 
         return info
 

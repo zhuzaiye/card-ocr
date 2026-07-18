@@ -2,6 +2,9 @@
 
 本地化、隐私优先的卡证 OCR 识别系统，支持身份证、银行卡、护照等多种卡证类型的自动识别与批量校对。
 
+<video src="./assets//test_demo_video.webm" width="60%" controls autoplay loop muted></video>
+
+
 ## 核心特性
 
 - ✅ **免模版智能分类**: 无需预选模版，后端根据关键词自动判定卡证类型（身份证正/反面、银行卡、护照）
