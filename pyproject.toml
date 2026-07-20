@@ -5,7 +5,7 @@ description = "基于 PP-OCRv6 ONNX 和 SSE 实时推送的本地卡证批量识
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = { text = "MIT" }
-authors = [{ name = "hanzi zhu", email = "hzzhu92@gamil.com" }]
+authors = [{ name = "hanzi zhu", email = "hzzhu92@gmail.com" }]
 dependencies = [
     "fastapi>=0.110.0",
     "uvicorn>=0.28.0",
